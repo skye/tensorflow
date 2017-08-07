@@ -18,6 +18,7 @@ limitations under the License.
 
 #include "tensorflow/cc/framework/gradients.h"
 #include "tensorflow/cc/framework/grad_op_registry.h"
+#include "tensorflow/cc/framework/while_gradients.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/core/framework/function.h"
 #include "tensorflow/core/framework/node_def_util.h"
@@ -25,8 +26,10 @@ limitations under the License.
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/graph/algorithm.h"
 #include "tensorflow/core/graph/graph_constructor.h"
+#include "tensorflow/core/graph/while_context.h"
 #include "tensorflow/core/lib/gtl/map_util.h"
 #include "tensorflow/core/platform/macros.h"
+#include "tensorflow/core/platform/stacktrace.h"
 
 namespace tensorflow {
 namespace {
@@ -78,6 +81,13 @@ class SymbolicGradientBuilder {
                           const std::vector<Output>& grad_inputs,
                           std::vector<Output>* grad_outputs);
 
+  // Creates the gradient subgraph for a while loop (or just stores
+  // `summed_grads` if not all incoming gradients are available yet). All exit
+  // nodes (which are the first nodes of a loop encountered in the backwards
+  // pass) are passed to this function rather than processed
+  // normally. `summed_grads` is the sum of `exit_node`s gradients.
+  Status ProcessWhileLoop(Node* exit_node, Output summed_grads);
+
   const Scope& scope_;
   const ops::GradOpRegistry* registry_;
   const std::vector<Output>& outputs_;
@@ -85,8 +95,7 @@ class SymbolicGradientBuilder {
   const std::vector<Output>& grad_inputs_;
   std::vector<Output>* grad_outputs_;
 
-  // A vector of output endpoints which represents backpropagated
-  // gradients
+  // A vector of output endpoints which represents backpropagated gradients
   typedef std::vector<Output> BackpropedGradients;
 
   // backprops_ is a map from a node output to its accumulated
@@ -105,13 +114,19 @@ class SymbolicGradientBuilder {
   // gradients from `grad_inputs_`.
   std::deque<Node*> ready_;
 
-  // The set of node ids in `outputs_`. Used to identify nodes at which to stop
-  // backprop.
+  // The set of node ids in `outputs_`. Used to identify nodes at which to
+  // stop backprop.
   std::unordered_set<int> output_nodes_;
 
   // The set of node ids in `inputs_`. Used to identify nodes at backprop
   // frontier. Maps from Output -> index into `grad_outputs_`.
   std::unordered_map<Output, int, OutputHash, OutputEq> input_nodes_;
+
+  // For each while loop in the graph, collects the summed gradients for each of
+  // the loop's exit nodes. Note that unlike backprops_, this map contains the
+  // output of SumGradients(), not the input (i.e. each exit node may have
+  // multiple incoming gradients, but we only store the combined Output here).
+  std::map<WhileContext*, std::map<Node*, Output>> while_backprops_;
 
   TF_DISALLOW_COPY_AND_ASSIGN(SymbolicGradientBuilder);
 };
@@ -266,6 +281,66 @@ Status SymbolicGradientBuilder::CallGradFunction(
   return Status::OK();
 }
 
+Status SymbolicGradientBuilder::ProcessWhileLoop(Node* exit_node,
+                                                 Output summed_grads) {
+  // TODO(skyewm): handle NoGradient in while loop
+  if (summed_grads == NoGradient()) {
+    return errors::Unimplemented(
+        "Missing gradient into while loop not yet implemented");
+  }
+
+  DCHECK(exit_node->IsExit());
+  WhileContext* while_ctx = exit_node->while_ctx();
+  DCHECK(while_ctx != nullptr);
+
+  // Record 'summed_grads' as the backprop input associated with 'exit_node'
+  std::map<Node*, Output>& backprops = while_backprops_[while_ctx];
+  DCHECK(backprops.find(exit_node) == backprops.end());
+  backprops[exit_node] = summed_grads;
+
+  // Wait until we have all exit nodes' backprops collected before processing
+  // the while loop.
+  if (backprops.size() < while_ctx->exit_nodes().size()) return Status::OK();
+
+  // We've seen all the exit nodes for this loop and have collected all the
+  // backprops. Create the gradient graph for the while loop.
+
+  Scope while_scope = scope_.NewSubScope(while_ctx->frame_name());
+
+  // Create forward loop counter, which counts how many times the while loop
+  // body executes.
+  Output forward_loop_count;
+  TF_RETURN_IF_ERROR(AddForwardLoopCounter(
+      while_ctx, while_scope.NewSubScope("ForwardLoopCounter"),
+      &forward_loop_count));
+
+  // Create backprop loop counter, which executes 'forward_loop_count' times in
+  // order to drive the gradient computation.
+  Output backprop_counter_cond;
+  TF_RETURN_IF_ERROR(AddBackPropLoopCounter(
+      while_ctx, forward_loop_count,
+      while_scope.NewSubScope("BackPropLoopCounter"), &backprop_counter_cond));
+
+  // Create the gradient while loop.
+  std::vector<Output> dy;
+  for (Node* n : while_ctx->exit_nodes()) dy.push_back(backprops[n]);
+  std::vector<Output> dx;
+  TF_RETURN_IF_ERROR(AddWhileGradientLoop(
+      while_ctx, dy, backprop_counter_cond, while_scope, &dx));
+
+  // Backprop along the in edges to the while loop (i.e. the inputs to the enter
+  // nodes)
+  DCHECK_EQ(dx.size(), while_ctx->enter_nodes().size());
+  for (int i = 0; i < dx.size(); ++i) {
+    Node* enter_node = while_ctx->enter_nodes()[i];
+    for (const Edge* e : enter_node->in_edges()) {
+      if (e->IsControlEdge()) continue;
+      TF_RETURN_IF_ERROR(BackpropAlongEdge(dx[i], {e->src(), e->src_output()}));
+    }
+  }
+  return Status::OK();
+}
+
 Status SymbolicGradientBuilder::AddGradients() {
   // Initialize backprops.
   TF_RETURN_IF_ERROR(Initialize());
@@ -276,6 +351,7 @@ Status SymbolicGradientBuilder::AddGradients() {
     // n has collected all gradients.
     Node* n = ready_.front();
     ready_.pop_front();
+    LOG(ERROR) << "n: " << n->name();
 
     // dy[i] is the sum of i-th output's backpropped gradients.
     const int num_y = n->num_outputs();
@@ -307,6 +383,15 @@ Status SymbolicGradientBuilder::AddGradients() {
     if (stop_node) {
       continue;
     }
+
+    // Special case: if we find an exit node, process the associated while loop
+    if (n->IsExit()) {
+      DCHECK_EQ(dy.size(), 1);
+      TF_RETURN_IF_ERROR(ProcessWhileLoop(n, dy[0]));
+      continue;
+    }
+    // All loop-specific control flow ops should have been handled above
+    DCHECK(!n->IsEnter() && !n->IsNextIteration()) << n->DebugString();
 
     const size_t num_no_grad = no_grad_dy_indices.size();
     if (IsPrimitiveOpWithNoGrad(n->type_string()) || num_no_grad == num_y) {
