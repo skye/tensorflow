@@ -23,10 +23,11 @@ limitations under the License.
 #ifndef __ANDROID__
 #include "tensorflow/cc/framework/gradients.h"
 #include "tensorflow/cc/framework/ops.h"
-#include "tensorflow/cc/framework/scope_internal.h"
 #include "tensorflow/cc/saved_model/loader.h"
 #endif
 #include "tensorflow/c/c_api_internal.h"
+#include "tensorflow/cc/framework/scope_internal.h"
+#include "tensorflow/cc/ops/while_loop.h"
 #include "tensorflow/core/common_runtime/device_mgr.h"
 #include "tensorflow/core/common_runtime/shape_refiner.h"
 #include "tensorflow/core/framework/allocation_description.pb.h"
@@ -42,6 +43,7 @@ limitations under the License.
 #include "tensorflow/core/graph/graph.h"
 #include "tensorflow/core/graph/graph_constructor.h"
 #include "tensorflow/core/graph/node_builder.h"
+#include "tensorflow/core/graph/while_context.h"
 #include "tensorflow/core/lib/core/coding.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/status.h"
@@ -62,6 +64,7 @@ using tensorflow::AllocationDescription;
 using tensorflow::DataType;
 using tensorflow::Graph;
 using tensorflow::GraphDef;
+using tensorflow::ImportGraphDefOptions;
 using tensorflow::NameRangeMap;
 using tensorflow::NameRangesForNode;
 using tensorflow::NewSession;
@@ -70,16 +73,21 @@ using tensorflow::NodeBuilder;
 using tensorflow::NodeDef;
 using tensorflow::OpDef;
 using tensorflow::OpRegistry;
+using tensorflow::Output;
+using tensorflow::OutputTensor;
 using tensorflow::PartialTensorShape;
 using tensorflow::RunMetadata;
 using tensorflow::RunOptions;
+using tensorflow::Scope;
 using tensorflow::Session;
+using tensorflow::ShapeRefiner;
 using tensorflow::Status;
 using tensorflow::Tensor;
 using tensorflow::TensorBuffer;
 using tensorflow::TensorId;
 using tensorflow::TensorShape;
 using tensorflow::TensorShapeProto;
+using tensorflow::WhileContext;
 using tensorflow::error::Code;
 using tensorflow::errors::FailedPrecondition;
 using tensorflow::errors::InvalidArgument;
@@ -831,6 +839,30 @@ const tensorflow::AttrValue* GetAttrValue(TF_Operation* oper,
   return attr;
 }
 
+TensorId ToTensorId(const TF_Output& output) {
+  return TensorId(output.oper->node.name(), output.index);
+}
+
+std::vector<tensorflow::Output> OutputsFromTFOutputs(TF_Output* tf_outputs,
+                                                     int n) {
+  std::vector<tensorflow::Output> outputs(n);
+  for (int i = 0; i < n; ++i) {
+    outputs[i] =
+        tensorflow::Output(&tf_outputs[i].oper->node, tf_outputs[i].index);
+  }
+  return outputs;
+}
+
+#ifndef __ANDROID__
+void TFOutputsFromOutputs(const std::vector<tensorflow::Output>& outputs,
+                          TF_Output* tf_outputs) {
+  for (int i = 0; i < outputs.size(); i++) {
+    tf_outputs[i].oper = ToOperation(outputs[i].node());
+    tf_outputs[i].index = outputs[i].index();
+  }
+}
+#endif  // __ANDROID__
+
 }  // namespace
 
 // Shape functions -----------------------------------------------------------
@@ -966,7 +998,7 @@ void TF_AddControlInput(TF_OperationDescription* desc, TF_Operation* input) {
 }
 
 void TF_ColocateWith(TF_OperationDescription* desc, TF_Operation* op) {
-  desc->colocation_constraints.emplace_back(
+  desc->colocation_constraints.emplace(
       StrCat(tensorflow::kColocationGroupPrefix, op->node.name()));
 }
 
@@ -979,12 +1011,20 @@ void TF_SetAttrString(TF_OperationDescription* desc, const char* attr_name,
 void TF_SetAttrStringList(TF_OperationDescription* desc, const char* attr_name,
                           const void* const* values, const size_t* lengths,
                           int num_values) {
-  std::vector<tensorflow::StringPiece> v;
-  v.reserve(num_values);
-  for (int i = 0; i < num_values; ++i) {
-    v.emplace_back(static_cast<const char*>(values[i]), lengths[i]);
+  if (strcmp(attr_name, tensorflow::kColocationAttrName) == 0) {
+    desc->colocation_constraints.clear();
+    for (int i = 0; i < num_values; ++i) {
+      desc->colocation_constraints.emplace(static_cast<const char*>(values[i]),
+                                           lengths[i]);
+    }
+  } else {
+    std::vector<tensorflow::StringPiece> v;
+    v.reserve(num_values);
+    for (int i = 0; i < num_values; ++i) {
+      v.emplace_back(static_cast<const char*>(values[i]), lengths[i]);
+    }
+    desc->node_builder.Attr(attr_name, v);
   }
-  desc->node_builder.Attr(attr_name, v);
 }
 
 void TF_SetAttrInt(TF_OperationDescription* desc, const char* attr_name,
@@ -1143,12 +1183,28 @@ void TF_SetAttrValueProto(TF_OperationDescription* desc, const char* attr_name,
                           const void* proto, size_t proto_len,
                           TF_Status* status) {
   tensorflow::AttrValue attr_value;
-  if (attr_value.ParseFromArray(proto, proto_len)) {
-    desc->node_builder.Attr(attr_name, attr_value);
-    status->status = Status::OK();
-  } else {
+  if (!attr_value.ParseFromArray(proto, proto_len)) {
     status->status = InvalidArgument("Unparseable AttrValue proto");
+    return;
   }
+
+  if (strcmp(attr_name, tensorflow::kColocationAttrName) == 0) {
+    if (attr_value.value_case() != tensorflow::AttrValue::kList &&
+        attr_value.value_case() != tensorflow::AttrValue::VALUE_NOT_SET) {
+      status->status =
+          InvalidArgument("Expected \"list\" field for \"",
+                          tensorflow::kColocationAttrName, "\" attribute");
+      return;
+    }
+    desc->colocation_constraints.clear();
+    for (const tensorflow::string& location : attr_value.list().s()) {
+      desc->colocation_constraints.insert(location);
+    }
+  } else {
+    desc->node_builder.Attr(attr_name, attr_value);
+  }
+
+  status->status = Status::OK();
 }
 
 static TF_Operation* TF_FinishOperationLocked(TF_OperationDescription* desc,
@@ -1160,10 +1216,12 @@ static TF_Operation* TF_FinishOperationLocked(TF_OperationDescription* desc,
     status->status = InvalidArgument("Duplicate node name in graph: '",
                                      desc->node_builder.node_name(), "'");
   } else {
-    std::sort(desc->colocation_constraints.begin(),
-              desc->colocation_constraints.end());
-    desc->node_builder.Attr(tensorflow::kColocationAttrName,
-                            desc->colocation_constraints);
+    if (!desc->colocation_constraints.empty()) {
+      desc->node_builder.Attr(
+          tensorflow::kColocationAttrName,
+          std::vector<tensorflow::string>(desc->colocation_constraints.begin(),
+                                          desc->colocation_constraints.end()));
+    }
     status->status = desc->node_builder.Finalize(&desc->graph->graph, &ret);
 
     if (status->status.ok()) {
@@ -1695,14 +1753,6 @@ void TF_ImportGraphDefOptionsSetPrefix(TF_ImportGraphDefOptions* opts,
   opts->opts.prefix = prefix;
 }
 
-namespace {
-
-TensorId ToTensorId(const TF_Output& output) {
-  return TensorId(output.oper->node.name(), output.index);
-}
-
-}  // namespace
-
 void TF_ImportGraphDefOptionsAddInputMapping(TF_ImportGraphDefOptions* opts,
                                              const char* src_name,
                                              int src_index, TF_Output dst) {
@@ -1786,6 +1836,8 @@ void TF_GraphImportGraphDef(TF_Graph* graph, const TF_Buffer* graph_def,
 // While loop functions -------------------------------------------------------
 
 namespace {
+// Creates a placeholder representing an input to the cond or body graph
+// TODO(skyewm): remove these from final graph
 bool CreateInput(const TF_Output& parent_input, TF_Graph* g, const char* name,
                  TF_Output* input, TF_Status* status) {
   TF_OperationDescription* desc = TF_NewOperation(g, "Placeholder", name);
@@ -1797,128 +1849,46 @@ bool CreateInput(const TF_Output& parent_input, TF_Graph* g, const char* name,
   return true;
 }
 
-bool CreateEnter(TF_Graph* g, const char* node_name, const char* frame_name,
-                 const TF_Output& input, TF_Output* enter, TF_Status* status)
-    EXCLUSIVE_LOCKS_REQUIRED(g->mu) {
-  TF_OperationDescription* desc = TF_NewOperationLocked(g, "Enter", node_name);
-  TF_AddInput(desc, input);
-  TF_SetAttrString(desc, "frame_name", frame_name, strlen(frame_name));
-  TF_Operation* oper = TF_FinishOperationLocked(desc, status);
-  if (!status->status.ok()) return false;
-  *enter = {oper, 0};
-  return true;
-}
-
-bool CreateMerge(TF_Graph* g, const char* name, const TF_Output& input,
-                 const char* backedge_name, int backedge_index,
-                 TF_Output* merge, TF_Status* status)
-    EXCLUSIVE_LOCKS_REQUIRED(g->mu) {
-  TF_OperationDescription* desc = TF_NewOperationLocked(g, "Merge", name);
-
-  // The merge nodes accept the while loop's back edges as an input. Use the
-  // underlying NodeBuilder API directly to create an input to the
-  // not-yet-created back edge.
-  std::vector<NodeBuilder::NodeOut> input_list;
-  input_list.push_back(NodeBuilder::NodeOut(&input.oper->node, input.index));
-  // All merge inputs must have same type
-  DataType type = input.oper->node.output_type(input.index);
-  input_list.push_back(
-      NodeBuilder::NodeOut(backedge_name, backedge_index, type));
-
-  desc->node_builder.Input(input_list);
-
-  TF_Operation* oper = TF_FinishOperationLocked(desc, status);
-  if (!status->status.ok()) return false;
-  *merge = {oper, 0};
-  return true;
-}
-
-bool CreateSwitch(TF_Graph* g, const char* name, const TF_Output& input,
-                  const TF_Output& predicate, TF_Output* switch_true,
-                  TF_Output* switch_false, TF_Status* status)
-    EXCLUSIVE_LOCKS_REQUIRED(g->mu) {
-  TF_OperationDescription* desc = TF_NewOperationLocked(g, "Switch", name);
-  TF_AddInput(desc, input);
-  TF_AddInput(desc, predicate);
-  TF_Operation* oper = TF_FinishOperationLocked(desc, status);
-  if (!status->status.ok()) return false;
-  *switch_false = {oper, 0};
-  *switch_true = {oper, 1};
-  return true;
-}
-
-bool CreateNext(TF_Graph* g, const char* name, const TF_Output& input,
-                TF_Output* next, TF_Status* status)
-    EXCLUSIVE_LOCKS_REQUIRED(g->mu) {
-  TF_OperationDescription* desc =
-      TF_NewOperationLocked(g, "NextIteration", name);
-  TF_AddInput(desc, input);
-  TF_Operation* oper = TF_FinishOperationLocked(desc, status);
-  if (!status->status.ok()) return false;
-  *next = {oper, 0};
-  return true;
-}
-
-bool CreateExit(TF_Graph* g, const char* name, const TF_Output& input,
-                TF_Output* exit, TF_Status* status)
-    EXCLUSIVE_LOCKS_REQUIRED(g->mu) {
-  TF_OperationDescription* desc = TF_NewOperationLocked(g, "Exit", name);
-  TF_AddInput(desc, input);
-  TF_Operation* oper = TF_FinishOperationLocked(desc, status);
-  if (!status->status.ok()) return false;
-  *exit = {oper, 0};
-  return true;
-}
-
-class ScopedImportGraphDefOptions {
- public:
-  ScopedImportGraphDefOptions() { opts_ = TF_NewImportGraphDefOptions(); }
-  ~ScopedImportGraphDefOptions() { TF_DeleteImportGraphDefOptions(opts_); }
-
-  TF_ImportGraphDefOptions* get() const { return opts_; }
-
- private:
-  TF_ImportGraphDefOptions* opts_;
-
-  TF_DISALLOW_COPY_AND_ASSIGN(ScopedImportGraphDefOptions);
-};
-
 // Copies `src_graph` into `dst_graph`. Any node in `src_graph` with input
 // `src_inputs[i]` will have that input replaced with `dst_inputs[i]`.
 // `prefix` will be prepended to copied node names. `return_nodes` are nodes
 // in `src_graph`, and the new corresponding nodes in `dst_graph` will be
 // returned. `return_nodes` should be preallocated to size `nreturn_nodes`.
-bool CopyGraph(TF_Graph* src_graph, TF_Graph* dst_graph,
-               const TF_Output* src_inputs,
-               const std::vector<TF_Output>& dst_inputs, const char* prefix,
-               const TF_Output* nodes_to_return, int nreturn_nodes,
-               TF_Output* return_nodes, TF_Status* s)
-    EXCLUSIVE_LOCKS_REQUIRED(dst_graph->mu) {
+Status CopyGraph(Graph* src_graph, Graph* dst_graph,
+                 tensorflow::ShapeRefiner* dst_refiner,
+                 const TF_Output* src_inputs,
+                 const std::vector<tensorflow::Output>& dst_inputs,
+                 const string& prefix, const TF_Output* nodes_to_return,
+                 int nreturn_nodes,
+                 std::vector<tensorflow::Output>* return_nodes) {
   GraphDef gdef;
-  src_graph->graph.ToGraphDef(&gdef);
+  src_graph->ToGraphDef(&gdef);
 
-  ScopedImportGraphDefOptions opts;
-  TF_ImportGraphDefOptionsSetPrefix(opts.get(), prefix);
+  tensorflow::ImportGraphDefOptions opts;
+  opts.prefix = prefix;
 
   for (int i = 0; i < dst_inputs.size(); ++i) {
-    TensorId src = ToTensorId(src_inputs[i]);
-    TF_ImportGraphDefOptionsAddInputMapping(opts.get(), src.first.data(),
-                                            src.second, dst_inputs[i]);
+    opts.input_map[ToTensorId(src_inputs[i])] =
+        TensorId(dst_inputs[i].node()->name(), dst_inputs[i].index());
   }
+
   // We use the pivot node to control constants in `src_graph`
-  TF_Operation* pivot = dst_inputs[0].oper;
-  TF_ImportGraphDefOptionsAddControlDependency(opts.get(), pivot);
+  Node* pivot = dst_inputs[0].node();
+  opts.control_dependencies.push_back(pivot->name());
 
   for (int i = 0; i < nreturn_nodes; ++i) {
-    TF_ImportGraphDefOptionsAddReturnOutput(
-        opts.get(), nodes_to_return[i].oper->node.name().c_str(),
-        nodes_to_return[i].index);
+    opts.return_tensors.push_back(ToTensorId(nodes_to_return[i]));
   }
 
-  GraphImportGraphDefLocked(dst_graph, gdef, opts.get(), return_nodes,
-                            nreturn_nodes, s);
-  if (TF_GetCode(s) != TF_OK) return false;
-  return true;
+  // TOOD(skyewm): change to OutputTensor
+  std::vector<std::pair<Node*, int>> return_tensors;
+  TF_RETURN_IF_ERROR(
+      ImportGraphDef(opts, gdef, dst_graph, dst_refiner, &return_tensors));
+
+  for (const auto& pair : return_tensors) {
+    return_nodes->emplace_back(pair.first, pair.second);
+  }
+  return Status::OK();
 }
 
 bool ValidateConstWhileParams(const TF_WhileParams& params, TF_Status* s) {
@@ -1967,6 +1937,39 @@ TF_WhileParams EmptyWhileParams() {
           nullptr, nullptr, nullptr, nullptr};
 }
 
+// Utility function for converting to internal C++ datatypes
+OutputTensor ToOutputTensor(TF_Output output) {
+  return OutputTensor(&output.oper->node, output.index);
+}
+
+// Utility function for converting to internal C++ datatypes
+std::vector<OutputTensor> ToOutputTensors(
+    const std::vector<TF_Output>& outputs) {
+  std::vector<OutputTensor> result(outputs.size());
+  for (int i = 0; i < outputs.size(); ++i) {
+    result[i] = ToOutputTensor(outputs[i]);
+  }
+  return result;
+}
+
+// Utility function for converting to internal C++ datatypes
+std::vector<Node*> ToNodes(const std::vector<TF_Output>& outputs) {
+  std::vector<Node*> result(outputs.size());
+  for (int i = 0; i < outputs.size(); ++i) {
+    result[i] = (&outputs[i].oper->node);
+  }
+  return result;
+}
+
+// Utility function for converting to C++ datatypes
+std::vector<Output> ToOutputs(TF_Output* outputs, int noutputs) {
+  std::vector<Output> result(noutputs);
+  for (int i = 0; i < noutputs; ++i) {
+    result[i] = Output(&outputs[i].oper->node, outputs[i].index);
+  }
+  return result;
+}
+
 }  // namespace
 
 TF_WhileParams TF_NewWhile(TF_Graph* g, TF_Output* inputs, int ninputs,
@@ -1977,8 +1980,8 @@ TF_WhileParams TF_NewWhile(TF_Graph* g, TF_Output* inputs, int ninputs,
     return EmptyWhileParams();
   }
 
-  TF_Graph* cond_graph = TF_NewGraph();
-  TF_Graph* body_graph = TF_NewGraph();
+  TF_Graph* cond_graph = new TF_Graph();
+  TF_Graph* body_graph = new TF_Graph();
   cond_graph->parent = g;
   cond_graph->parent_inputs = inputs;
   body_graph->parent = g;
@@ -2026,71 +2029,57 @@ void TF_FinishWhileHelper(const TF_WhileParams* params, TF_Status* status,
 
   mutex_lock l(parent->mu);
 
-  // Create Enter nodes
-  std::vector<TF_Output> enter_nodes(n);
-  for (int i = 0; i < n; ++i) {
-    if (!CreateEnter(parent, StrCat(params->name, "/enter", i).c_str(),
-                     params->name, parent_inputs[i], &enter_nodes[i], status)) {
-      return;
-    }
+  // 'cond_fn' copies the cond graph into the parent graph
+  tensorflow::ops::CondGraphBuilderFn cond_fn =
+      [params, parent](const tensorflow::Scope& scope,
+                       const std::vector<tensorflow::Output>& inputs,
+                       tensorflow::Output* output) {
+        DCHECK_EQ(scope.graph(), &parent->graph);
+        std::vector<tensorflow::Output> cond_output;
+        TF_RETURN_IF_ERROR(CopyGraph(&params->cond_graph->graph, &parent->graph,
+                                     &parent->refiner, params->cond_inputs,
+                                     inputs, scope.impl()->name(),
+                                     &params->cond_output, 1, &cond_output));
+        *output = cond_output[0];
+        return Status::OK();
+      };
+
+  // 'body_fn' copies the body graph into the parent graph
+  tensorflow::ops::BodyGraphBuilderFn body_fn =
+      [params, parent, n](const tensorflow::Scope& scope,
+                          const std::vector<tensorflow::Output>& inputs,
+                          std::vector<tensorflow::Output>* outputs) {
+        DCHECK_EQ(scope.graph(), &parent->graph);
+        TF_RETURN_IF_ERROR(CopyGraph(&params->body_graph->graph, &parent->graph,
+                                     &parent->refiner, params->body_inputs,
+                                     inputs, scope.impl()->name(),
+                                     params->body_outputs, n, outputs));
+        return Status::OK();
+      };
+
+  // Create the while loop using an internal scope
+  tensorflow::Scope scope =
+      NewInternalScope(&parent->graph, &status->status, &parent->refiner)
+          .NewSubScope(params->name);
+
+  const int max_node_id_before = parent->graph.num_node_ids();
+
+  tensorflow::OutputList loop_outputs;
+  status->status = tensorflow::ops::BuildWhileLoop(
+      scope, OutputsFromTFOutputs(parent_inputs, n), cond_fn, body_fn,
+      params->name, true, &loop_outputs);
+
+  // Update name_map with newly-created ops
+  for (int i = max_node_id_before; i < parent->graph.num_node_ids(); ++i) {
+    Node* n = parent->graph.FindNodeId(i);
+    if (n == nullptr) continue;
+    parent->name_map[n->name()] = n;
   }
 
-  // Create Merge nodes
-  std::vector<TF_Output> merge_nodes(n);
-  for (int i = 0; i < n; ++i) {
-    if (!CreateMerge(parent, StrCat(params->name, "/merge", i).c_str(),
-                     enter_nodes[i], StrCat(params->name, "/next", i).c_str(),
-                     0, &merge_nodes[i], status)) {
-      return;
-    }
-  }
-
-  // Copy cond_graph to parent and replace input placeholders with merge node
-  // outputs, and get handle to new cond output
-  tensorflow::string cond_prefix = StrCat(params->name, "/cond");
-  TF_Output cond_output;
-  if (!CopyGraph(params->cond_graph, parent, params->cond_inputs, merge_nodes,
-                 cond_prefix.c_str(), &params->cond_output, 1, &cond_output,
-                 status)) {
-    return;
-  }
-
-  // Create Switch nodes
-  std::vector<TF_Output> switch_trues(n);
-  std::vector<TF_Output> switch_falses(n);
-  for (int i = 0; i < n; ++i) {
-    if (!CreateSwitch(parent, StrCat(params->name, "/switch", i).c_str(),
-                      merge_nodes[i], cond_output, &switch_trues[i],
-                      &switch_falses[i], status)) {
-      return;
-    }
-  }
-
-  // Copy body_graph to parent, replace input placeholders with switch node
-  // true outputs, and get handles to new body outputs
-  tensorflow::string body_prefix = StrCat(params->name, "/body");
-  std::vector<TF_Output> body_outputs(n);
-  if (!CopyGraph(params->body_graph, parent, params->body_inputs, switch_trues,
-                 body_prefix.c_str(), params->body_outputs, n,
-                 body_outputs.data(), status)) {
-    return;
-  }
-
-  // Create Next nodes
-  std::vector<TF_Output> next_nodes(n);
-  for (int i = 0; i < n; ++i) {
-    if (!CreateNext(parent, StrCat(params->name, "/next", i).c_str(),
-                    body_outputs[i], &next_nodes[i], status)) {
-      return;
-    }
-  }
-
-  // Create Exit nodes (which are the outputs of the while loop)
-  for (int i = 0; i < n; ++i) {
-    if (!CreateExit(parent, StrCat(params->name, "/exit", i).c_str(),
-                    switch_falses[i], &outputs[i], status)) {
-      return;
-    }
+  // Populate 'outputs'
+  DCHECK_LE(loop_outputs.size(), n);
+  for (int i = 0; i < loop_outputs.size(); ++i) {
+    outputs[i] = {ToOperation(loop_outputs[i].node()), loop_outputs[i].index()};
   }
 }
 
@@ -2106,29 +2095,6 @@ void TF_FinishWhile(const TF_WhileParams* params, TF_Status* status,
 
 void TF_AbortWhile(const TF_WhileParams* params) { FreeWhileResources(params); }
 
-#ifndef __ANDROID__
-namespace {
-
-void OutputsFromTFOutputs(TF_Output* tf_outputs, int n, TF_Status* status,
-                          std::vector<tensorflow::Output>* outputs) {
-  outputs->resize(n);
-  for (int i = 0; i < n; i++) {
-    const TF_Output& tf_output = tf_outputs[i];
-    (*outputs)[i] = tensorflow::Output(&tf_output.oper->node, tf_output.index);
-  }
-}
-
-void TFOutputsFromOutputs(const std::vector<tensorflow::Output>& outputs,
-                          TF_Output* tf_outputs) {
-  for (int i = 0; i < outputs.size(); i++) {
-    tf_outputs[i].oper = ToOperation(outputs[i].node());
-    tf_outputs[i].index = outputs[i].index();
-  }
-}
-
-}  // namespace
-#endif  // __ANDROID__
-
 void TF_AddGradients(TF_Graph* g, TF_Output* y, int ny, TF_Output* x, int nx,
                      TF_Output* dx, TF_Status* status, TF_Output* dy) {
 #ifdef __ANDROID__
@@ -2137,11 +2103,9 @@ void TF_AddGradients(TF_Graph* g, TF_Output* y, int ny, TF_Output* x, int nx,
       "https://github.com/tensorflow/tensorflow/issues if this feature is "
       "important to you");
 #else
-  std::vector<tensorflow::Output> y_arg;
-  std::vector<tensorflow::Output> x_arg;
+  std::vector<tensorflow::Output> y_arg = OutputsFromTFOutputs(y, ny);
+  std::vector<tensorflow::Output> x_arg = OutputsFromTFOutputs(x, nx);
   std::vector<tensorflow::Output> dy_arg;
-  OutputsFromTFOutputs(y, ny, status, &y_arg);
-  OutputsFromTFOutputs(x, nx, status, &x_arg);
 
   {
     // We need to hold on to the lock while we have a scope that uses TF_Graph.
@@ -2149,13 +2113,11 @@ void TF_AddGradients(TF_Graph* g, TF_Output* y, int ny, TF_Output* x, int nx,
 
     const int max_node_id_before = g->graph.num_node_ids();
 
-    tensorflow::Scope scope =
-        NewInternalScope(&g->graph, &status->status, &g->refiner)
-            .NewSubScope("gradients");
+    Scope scope = NewInternalScope(&g->graph, &status->status, &g->refiner)
+                      .NewSubScope("gradients");
 
     if (dx != nullptr) {
-      std::vector<tensorflow::Output> dx_arg;
-      OutputsFromTFOutputs(dx, ny, status, &dx_arg);
+      std::vector<tensorflow::Output> dx_arg = OutputsFromTFOutputs(dx, ny);
       status->status =
           AddSymbolicGradients(scope, y_arg, x_arg, dx_arg, &dy_arg);
     } else {

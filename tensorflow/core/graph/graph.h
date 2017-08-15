@@ -546,6 +546,8 @@ class Graph {
                          std::vector<OutputTensor> body_outputs,
                          WhileContext** result);
 
+  string DebugString() const;
+
   // TODO(josh11b): uint64 hash() const;
 
  private:

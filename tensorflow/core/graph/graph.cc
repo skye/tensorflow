@@ -380,6 +380,8 @@ const Edge* Graph::AddEdge(Node* source, int x, Node* dest, int y) {
     DCHECK_EQ(y, kControlSlot) << dest->DebugString();
   }
 
+  // Update props_ to reflect new input
+
   Edge* e = nullptr;
   if (free_edges_.empty()) {
     e = new (arena_.Alloc(sizeof(Edge))) Edge;  // placement new
@@ -572,6 +574,12 @@ Status Graph::AddWhileContext(StringPiece frame_name,
   }
   *result = &pair.first->second;
   return Status::OK();
+}
+
+string Graph::DebugString() const {
+  GraphDef gdef;
+  ToGraphDef(&gdef);
+  return gdef.DebugString();
 }
 
 }  // namespace tensorflow
