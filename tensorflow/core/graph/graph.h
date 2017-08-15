@@ -62,6 +62,7 @@ class Graph;
 class GraphDef;
 class Node;
 class VersionDef;
+class WhileContext;
 
 class NeighborIter;  // Declared below
 class NodeIter;      // Declared below
@@ -184,6 +185,13 @@ class Node {
   Status input_node(int idx, const Node** n) const;
   Status input_node(int idx, Node** n) const;
 
+  WhileContext* while_ctx() const { return while_ctx_; }
+  void set_while_ctx(WhileContext* while_ctx) {
+    DCHECK(IsExit());
+    DCHECK(while_ctx_ == nullptr);
+    while_ctx_ = while_ctx;
+  }
+
  private:
   friend class Graph;
   Node();
@@ -256,7 +264,33 @@ class Node {
   // field and reclaim that memory.
   Graph* graph_;
 
+  // If this is an exit node, set to the WhileContext associated with the while
+  // loop this node is part of. Otherwise null. (This is only set for exit nodes
+  // because they're the first nodes of a loop encountered while creating the
+  // gradient graph.)
+  WhileContext* while_ctx_;
+
   TF_DISALLOW_COPY_AND_ASSIGN(Node);
+};
+
+// Represents an input to a node, i.e., the `index`-th input to `node`.
+struct InputTensor {
+  Node* node;
+  int index;
+
+  InputTensor(Node* n, int i) : node(n), index(i) {}
+  InputTensor() : node(nullptr), index(0) {}
+};
+
+// Represents an output of a node, i.e., the `index`-th output of `node`. Note
+// that a single `OutputTensor` can correspond to multiple `Edge`s if the output
+// is consumed by multiple destination nodes.
+struct OutputTensor {
+  Node* node;
+  int index;
+
+  OutputTensor(Node* n, int i) : node(n), index(i) {}
+  OutputTensor() : node(nullptr), index(0) {}
 };
 
 class Edge {
@@ -503,6 +537,17 @@ class Graph {
     node->assigned_device_name_index_ = InternDeviceName(device_name);
   }
 
+  // Create and return a new WhileContext owned by this graph. This is called
+  // when a new while loop is created.
+  Status AddWhileContext(StringPiece frame_name, std::vector<Node*> enter_nodes,
+                         std::vector<Node*> exit_nodes,
+                         OutputTensor cond_output,
+                         std::vector<OutputTensor> body_inputs,
+                         std::vector<OutputTensor> body_outputs,
+                         WhileContext** result);
+
+  string DebugString() const;
+
   // TODO(josh11b): uint64 hash() const;
 
  private:
@@ -569,6 +614,12 @@ class Graph {
 
   // Maps unique device names to indices within device_names_[i].
   std::unordered_map<string, int> device_names_map_;
+
+  // All the while contexts owned by this graph, keyed by frame name,
+  // corresonding to all the while loops contained in this graph (including
+  // nested loops). The stored contexts are usually accessed via
+  // AddWhileContext() or Node::while_ctx() but this manages the lifetime.
+  std::map<string, WhileContext> while_ctxs_;
 
   TF_DISALLOW_COPY_AND_ASSIGN(Graph);
 };
