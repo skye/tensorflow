@@ -419,6 +419,15 @@ void Graph::RemoveEdge(const Edge* e) {
   --num_edges_;
 }
 
+const Edge* Graph::AddControlEdge(Node* source, Node* dest,
+                                  bool update_node_def) {
+  if (update_node_def && !source->IsSource() && !dest->IsSink()) {
+    dest->MaybeCopyOnWrite();
+    dest->props_->node_def.add_input(strings::StrCat("^", source->name()));
+  }
+  return AddEdge(source, kControlSlot, dest, kControlSlot);
+}
+
 Status Graph::UpdateEdge(Node* new_src, int new_src_index, Node* dst,
                          int dst_index) {
   TF_RETURN_IF_ERROR(IsValidOutputTensor(new_src, new_src_index));
