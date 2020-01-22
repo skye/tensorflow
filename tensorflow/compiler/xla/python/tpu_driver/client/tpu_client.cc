@@ -572,7 +572,7 @@ PyTpuExecutable::ExecuteResult PyTpuExecutable::ExecuteHelper(
   CHECK(device_assignment_.Serialize(&device_assignment).ok());
   std::shared_ptr<tpu_driver::Event> on_execute_finished =
       client_->driver()->ExecuteProgram(
-          executables_[replica].get(), inputs,
+          executables_.find(replica)->second.get(), inputs,
           {output_buffer->DeviceBuffer()->handle.get()}, device_assignment,
           {ready_to_execute});
 
