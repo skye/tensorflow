@@ -945,7 +945,8 @@ PyLocalExecutable::ExecuteOnLocalDevices(
   std::vector<std::unique_ptr<PyLocalBuffer>> wrapped_results(
       num_local_devices);
   for (int i = 0; i < num_local_devices; ++i) {
-    auto [replica, partition] = local_logical_devices_[i];
+    const int replica = local_logical_devices_[i].first;
+    const int partition = local_logical_devices_[i].second;
     auto& statusor = results[i];
     if (!statusor.ok()) {
       return AppendStatus(
