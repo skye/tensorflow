@@ -686,8 +686,8 @@ PyTpuExecutable::ExecuteOnLocalDevices(
     thread_pool->Schedule([this, i, argument_handles, &results, &results_lock,
                            &execute_semaphore]() {
       const auto pair = local_logical_devices_[i];
-      const auto replica = pair.first;
-      const auto partition = pair.second;
+      const int replica = pair.first;
+      const int partition = pair.second;
       RunId run_id;
       auto result = ExecuteHelper(argument_handles, argument_handles[i],
                                   replica, partition, run_id);

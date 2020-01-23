@@ -882,7 +882,9 @@ PyLocalExecutable::ExecuteOnLocalDevices(
   if (num_local_devices == 1) {
     // Fast-path if there is only one device — run the computation on the
     // current thread.
-    const auto [replica, partition] = local_logical_devices_[0];
+    const auto pair = local_logical_devices_[0];
+    const int replica = pair.first;
+    const int partition = pair.second;
     results[0] =
         ExecuteHelper(argument_handles[0], replica, partition, RunId());
   } else {
