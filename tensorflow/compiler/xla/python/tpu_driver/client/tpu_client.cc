@@ -518,8 +518,8 @@ PyTpuExecutable::PyTpuExecutable(
       // TODO(b/147895917): support replica + partition natively.
       bool insert_success =
           executables_
-              .insert({replica, client_->driver()->LoadProgram(
-                                    device_id, compiled_program.get(), {})})
+              .insert({replica, std::move(client_->driver()->LoadProgram(
+                                    device_id, compiled_program.get(), {}))})
               .second;
       CHECK(insert_success) << "Inserting duplicate replica:" << replica;
       local_logical_devices_.emplace_back(replica, partition);
