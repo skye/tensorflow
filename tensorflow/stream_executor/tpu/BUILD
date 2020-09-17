@@ -216,6 +216,7 @@ cc_library(
 cc_library(
     name = "tpu_transfer_manager",
     srcs = ["tpu_transfer_manager_registration.cc"],
+    visibility = ["//visibility:public"],
     deps = [
         ":tpu_executor",
         ":tpu_transfer_manager_base",
@@ -250,6 +251,7 @@ cc_library(
     name = "tpu_computation_placer",
     srcs = ["tpu_computation_placer.cc"],
     hdrs = ["tpu_computation_placer.h"],
+    visibility = ["//visibility:public"],
     deps = [
         ":status_helper",
         ":tpu_executor",

@@ -174,6 +174,19 @@ cc_library(
 )
 
 cc_library(
+    name = "tpu_executor_dlsym_initializer",
+    srcs = ["tpu_executor_dlsym_initializer.cc"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":tpu_executor_init_fns",
+        "//tensorflow/core:lib",
+        "//tensorflow/stream_executor/tpu:tpu_computation_placer",
+        "//tensorflow/stream_executor/tpu:tpu_executor_c_api_hdrs",
+    ],
+    alwayslink = True,
+)
+
+cc_library(
     name = "tpu_library_init_fns",
     hdrs = ["tpu_library_init_fns.inc"],
     visibility = ["//visibility:public"],
@@ -283,6 +296,7 @@ cc_library(
 cc_library(
     name = "tpu_on_demand_compiler",
     srcs = ["tpu_on_demand_compiler.cc"],
+    visibility = ["//visibility:public"],
     deps = [
         "//tensorflow/compiler/xla:shape_util",
         "//tensorflow/compiler/xla:util",
