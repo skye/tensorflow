@@ -43,6 +43,8 @@ cc_library(
         "//tensorflow/compiler/xla:literal",
         "//tensorflow/compiler/xla:shape_util",
         "//tensorflow/compiler/xla/service:executable",
+        "//tensorflow/compiler/xla/service:hlo",
+        "//tensorflow/compiler/xla/service:hlo_module_config",
         "//tensorflow/compiler/xla/service:maybe_owning_device_memory",
         "//tensorflow/compiler/xla/service:shaped_buffer",
         "//tensorflow/core/tpu:tpu_api",
@@ -216,6 +218,7 @@ cc_library(
 cc_library(
     name = "tpu_transfer_manager",
     srcs = ["tpu_transfer_manager_registration.cc"],
+    visibility = ["//visibility:public"],
     deps = [
         ":tpu_executor",
         ":tpu_transfer_manager_base",
@@ -250,6 +253,7 @@ cc_library(
     name = "tpu_computation_placer",
     srcs = ["tpu_computation_placer.cc"],
     hdrs = ["tpu_computation_placer.h"],
+    visibility = ["//visibility:public"],
     deps = [
         ":status_helper",
         ":tpu_executor",

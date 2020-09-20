@@ -53,6 +53,10 @@ class TpuPlatformInterface : public stream_executor::Platform {
   virtual const TpuTopologyPtr GetTopologyPtr() = 0;
 
   virtual const TpuHostLocationExternal GetTpuHostLocation() const = 0;
+
+  TpuTopologyExternal topology() {
+    return TpuTopologyExternal(GetTopologyPtr());
+  }
 };
 
 }  // namespace tpu
