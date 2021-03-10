@@ -24,6 +24,7 @@ cc_library(
     copts = tf_profiler_copts(),
     visibility = [
         "//tensorflow/python/profiler/internal:__pkg__",
+        "//tensorflow/compiler/xla/python:__pkg__",
     ],
     deps = [
         ":profiler_client_for_pybind",

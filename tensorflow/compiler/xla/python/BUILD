@@ -445,9 +445,12 @@ cc_library(
     ],
     features = ["-use_header_modules"],
     deps = [
+        ":types",
+        "//tensorflow/compiler/xla:status",
         "//tensorflow/core/profiler/lib:profiler_backends",
         "//tensorflow/core/profiler/lib:profiler_session",
         "//tensorflow/core/profiler/rpc:profiler_server_impl",
+        "//tensorflow/core/profiler/rpc/client:capture_profile",
         "//tensorflow/python/profiler/internal:traceme_wrapper",
         "@pybind11",
     ],
