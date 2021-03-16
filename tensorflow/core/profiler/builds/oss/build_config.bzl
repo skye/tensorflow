@@ -16,4 +16,5 @@ def tf_profiler_pybind_cc_library_wrapper(name, actual, **kwargs):
     symbols in these deps symbols should be linked to, and exported by, the core
     pywrap_tensorflow_internal.so
     """
-    cc_header_only_library(name = name, deps = [actual], **kwargs)
+    native.alias(name = name, actual = actual, **kwargs)
+    #cc_header_only_library(name = name, deps = [actual], **kwargs)
